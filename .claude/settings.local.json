@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(gradle --version)",
+      "Bash(gradle wrapper:*)",
+      "Bash(java --version)",
+      "Bash(curl -L \"https://github.com/gradle/gradle/raw/v8.8.0/gradle/wrapper/gradle-wrapper.jar\" -o \"C:/claude-code/redis/gradle/wrapper/gradle-wrapper.jar\")"
+    ]
+  }
+}

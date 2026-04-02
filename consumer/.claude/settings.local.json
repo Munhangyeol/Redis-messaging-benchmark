@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find /c/claude-code/redis/consumer -type f -name *.xml -o -type f -name *.gradle -o -type f -name *.properties -o -type f -name *.yml -o -type f -name *.yaml -o -type f -name README* -o -type f -name Dockerfile*)",
+      "Bash(find /c/claude-code/redis/consumer/consumer -type f -name *.java -o -name *.yml -o -name *.yaml -o -name *.xml -o -name *.properties -o -name Dockerfile* -o -name README*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(netstat -ano)",
+      "Bash(findstr :6379)",
+      "Bash(tasklist /FI \"PID eq 20620\")",
+      "Bash(tasklist /FI \"PID eq 6316\")",
+      "Bash(tasklist)",
+      "Bash(./gradlew dependencies:*)",
+      "Bash(./gradlew compileJava)",
+      "Bash(timeout 15 ./gradlew bootRun)",
+      "Bash(docker stop:*)",
+      "Bash(redis-cli:*)",
+      "Bash(docker stats:*)",
+      "Bash(docker exec:*)"
+    ]
+  }
+}

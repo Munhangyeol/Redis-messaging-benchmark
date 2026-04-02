@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./gradlew compileJava --no-daemon)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(find /c/claude-code/redis/producer/src -name *.java)",
+      "Bash(find /c/claude-code/redis/consumer/src -name *.java)"
+    ]
+  }
+}

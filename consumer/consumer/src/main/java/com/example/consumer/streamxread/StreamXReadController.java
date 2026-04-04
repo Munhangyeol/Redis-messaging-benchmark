@@ -24,9 +24,9 @@ public class StreamXReadController {
         return consumer.start();
     }
 
-    @PostMapping("/stop")
-    public Map<String, Object> stop() {
-        return consumer.stop();
+    @PostMapping("/finish")
+    public Map<String, Object> finish() {
+        return consumer.finish();
     }
 
     @GetMapping("/stats")

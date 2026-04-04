@@ -3,7 +3,7 @@ import time
 
 PRODUCER = "http://localhost:8080"
 CONSUMER = "http://localhost:8081"
-N = 1000
+N = 10000
 
 PATTERNS = ["queue", "stream-xread", "stream-group", "pubsub"]
 
@@ -27,8 +27,8 @@ def benchmark(pattern: str, n: int = N):
         elapsed = time.time() - start
         print(f"  Producer 전송 완료: {elapsed:.2f}s ({n / elapsed:,.0f} msg/sec)")
 
-        # 3. Consumer 중지 + 결과 수신
-        res = consumer_session.post(f"{CONSUMER}/{pattern}/stop")
+        # 3. Producer 완료 신호 → Consumer가 남은 메시지 모두 처리 후 종료
+        res = consumer_session.post(f"{CONSUMER}/{pattern}/finish", timeout=120)
         res.raise_for_status()
         result = res.json()
         print(f"  Consumer 결과: {result}")
@@ -36,21 +36,23 @@ def benchmark(pattern: str, n: int = N):
 
 
 def main():
-    results = {}
-    for pattern in PATTERNS:
-        try:
-            results[pattern] = benchmark(pattern)
-        except requests.exceptions.ConnectionError as e:
-            print(f"  [ERROR] 연결 실패: {e}")
-        except Exception as e:
-            print(f"  [ERROR] {e}")
+    for i in range(5):  # 3번 반복
+        print(f"\n========== 벤치마크 횟수: {i + 1} ==========")
+        results = {}
+        for pattern in PATTERNS:
+            try:
+                results[pattern] = benchmark(pattern)
+            except requests.exceptions.ConnectionError as e:
+                print(f"  [ERROR] 연결 실패: {e}")
+            except Exception as e:
+                print(f"  [ERROR] {e}")
 
-    print("\n========== 최종 결과 ==========")
-    for pattern, result in results.items():
-        throughput = result.get("throughput", "N/A")
-        duration = result.get("durationMs", "N/A")
-        total = result.get("totalMessages", "N/A")
-        print(f"  {pattern:<15} {throughput:<25} (총 {total:,}건 / {duration}ms)")
+        print("\n========== 최종 결과 ==========")
+        for pattern, result in results.items():
+            throughput = result.get("throughput", "N/A")
+            duration = result.get("durationMs", "N/A")
+            total = result.get("totalMessages", "N/A")
+            print(f"  {pattern:<15} {throughput:<25} (총 {total:,}건 / {duration}ms)")
 
 
 if __name__ == "__main__":

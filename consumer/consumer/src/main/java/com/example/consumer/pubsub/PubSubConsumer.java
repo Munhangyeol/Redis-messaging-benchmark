@@ -28,8 +28,10 @@ public class PubSubConsumer implements MessageListener {
     private final BenchmarkResultRepository resultRepository;
     private final MessageRecordRepository messageRecordRepository;
 
-    private final AtomicBoolean running = new AtomicBoolean(false);
+    private final AtomicBoolean accepting = new AtomicBoolean(false);
     private final AtomicLong messageCount = new AtomicLong(0);
+    // push 기반이므로 onMessage가 listener 스레드에서 동시 호출될 수 있음
+    private final AtomicLong inFlight = new AtomicLong(0);
     private volatile Instant startTime;
 
     public PubSubConsumer(RedisMessageListenerContainer listenerContainer,
@@ -41,10 +43,11 @@ public class PubSubConsumer implements MessageListener {
     }
 
     public Map<String, Object> start() {
-        if (!running.compareAndSet(false, true)) {
+        if (!accepting.compareAndSet(false, true)) {
             return Map.of("status", "already_running", "totalMessages", messageCount.get());
         }
         messageCount.set(0);
+        inFlight.set(0);
         startTime = Instant.now();
         listenerContainer.addMessageListener(this, new ChannelTopic(CHANNEL));
         return Map.of("status", "started", "channel", CHANNEL);
@@ -52,17 +55,29 @@ public class PubSubConsumer implements MessageListener {
 
     @Override
     public void onMessage(Message message, byte[] pattern) {
-        String payload = new String(message.getBody());
-        messageRecordRepository.save(
-                new MessageRecord(BenchmarkResult.PatternType.PUBSUB, payload, LocalDateTime.now()));
-        messageCount.incrementAndGet();
+        if (!accepting.get()) return;
+        inFlight.incrementAndGet();
+        try {
+            String payload = new String(message.getBody());
+            messageRecordRepository.save(
+                    new MessageRecord(BenchmarkResult.PatternType.PUBSUB, payload, LocalDateTime.now()));
+            messageCount.incrementAndGet();
+        } finally {
+            inFlight.decrementAndGet();
+        }
     }
 
-    public Map<String, Object> stop() {
-        if (!running.compareAndSet(true, false)) {
+    public Map<String, Object> finish() {
+        if (!accepting.compareAndSet(true, false)) {
             return Map.of("status", "not_running");
         }
+        // 새 메시지 수신 중단
         listenerContainer.removeMessageListener(this);
+
+        // 리스너 제거 전 마지막으로 dispatch된 onMessage 호출이 완료될 때까지 대기
+        while (inFlight.get() > 0) {
+            try { Thread.sleep(10); } catch (InterruptedException e) { Thread.currentThread().interrupt(); break; }
+        }
 
         Instant endTime = Instant.now();
         long count = messageCount.get();
@@ -82,7 +97,7 @@ public class PubSubConsumer implements MessageListener {
         long count = messageCount.get();
         long durationMs = startTime != null ? Duration.between(startTime, Instant.now()).toMillis() : 0;
         double throughput = durationMs > 0 ? count * 1000.0 / durationMs : 0;
-        return buildStats(count, durationMs, throughput, running.get());
+        return buildStats(count, durationMs, throughput, accepting.get());
     }
 
     private Map<String, Object> buildStats(long count, long durationMs, double throughput, boolean isRunning) {

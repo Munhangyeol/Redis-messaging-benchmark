@@ -2,6 +2,8 @@ package com.example.consumer.queue;
 
 import com.example.consumer.common.BenchmarkResult;
 import com.example.consumer.common.BenchmarkResultRepository;
+import com.example.consumer.common.MessageRecord;
+import com.example.consumer.common.MessageRecordRepository;
 import jakarta.annotation.PreDestroy;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
@@ -12,6 +14,7 @@ import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -22,19 +25,22 @@ public class QueueConsumer {
 
     private final StringRedisTemplate redisTemplate;
     private final BenchmarkResultRepository resultRepository;
+    private final MessageRecordRepository messageRecordRepository;
 
-    private final AtomicBoolean running = new AtomicBoolean(false);
+    private final AtomicBoolean accepting = new AtomicBoolean(false);
     private final AtomicLong messageCount = new AtomicLong(0);
     private volatile Instant startTime;
     private volatile Thread consumerThread;
 
-    public QueueConsumer(StringRedisTemplate redisTemplate, BenchmarkResultRepository resultRepository) {
+    public QueueConsumer(StringRedisTemplate redisTemplate, BenchmarkResultRepository resultRepository,
+                         MessageRecordRepository messageRecordRepository) {
         this.redisTemplate = redisTemplate;
         this.resultRepository = resultRepository;
+        this.messageRecordRepository = messageRecordRepository;
     }
 
     public Map<String, Object> start() {
-        if (!running.compareAndSet(false, true)) {
+        if (!accepting.compareAndSet(false, true)) {
             return Map.of("status", "already_running", "totalMessages", messageCount.get());
         }
         messageCount.set(0);
@@ -46,33 +52,36 @@ public class QueueConsumer {
     }
 
     private void consume() {
-        while (running.get()) {
+        while (true) {
             try {
-                String value = redisTemplate.opsForList().rightPop(QUEUE_KEY);
-                if (value != null) {
-                    messageCount.incrementAndGet();
+                String value;
+                if (accepting.get()) {
+                    // producer 진행 중: 블로킹 pop (최대 1초 대기)
+                    value = redisTemplate.opsForList().rightPop(QUEUE_KEY, 1, TimeUnit.SECONDS);
                 } else {
-                    Thread.sleep(10);
+                    // producer 완료 신호 받음: 논블로킹으로 남은 메시지 드레인
+                    value = redisTemplate.opsForList().rightPop(QUEUE_KEY);
+                    if (value == null) break; // 큐 비었음 → 종료
                 }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
+                if (value != null) {
+                    messageRecordRepository.save(
+                            new MessageRecord(BenchmarkResult.PatternType.QUEUE, value, LocalDateTime.now()));
+                    messageCount.incrementAndGet();
+                }
             } catch (Exception e) {
-                try { Thread.sleep(1000); } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    break;
-                }
+                if (!accepting.get()) break;
             }
         }
     }
 
-    public Map<String, Object> stop() {
-        if (!running.compareAndSet(true, false)) {
+    public Map<String, Object> finish() {
+        if (!accepting.compareAndSet(true, false)) {
             return Map.of("status", "not_running");
         }
+        // consumer 스레드가 남은 메시지를 모두 처리하고 자기 종료할 때까지 대기
         if (consumerThread != null) {
             try {
-                consumerThread.join(3000);
+                consumerThread.join(120_000);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
@@ -95,7 +104,7 @@ public class QueueConsumer {
         long count = messageCount.get();
         long durationMs = startTime != null ? Duration.between(startTime, Instant.now()).toMillis() : 0;
         double throughput = durationMs > 0 ? count * 1000.0 / durationMs : 0;
-        return buildStats(count, durationMs, throughput, running.get());
+        return buildStats(count, durationMs, throughput, accepting.get());
     }
 
     private Map<String, Object> buildStats(long count, long durationMs, double throughput, boolean isRunning) {
@@ -110,6 +119,6 @@ public class QueueConsumer {
 
     @PreDestroy
     public void destroy() {
-        running.set(false);
+        accepting.set(false);
     }
 }

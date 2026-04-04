@@ -2,6 +2,8 @@ package com.example.consumer.streamxread;
 
 import com.example.consumer.common.BenchmarkResult;
 import com.example.consumer.common.BenchmarkResultRepository;
+import com.example.consumer.common.MessageRecord;
+import com.example.consumer.common.MessageRecordRepository;
 import jakarta.annotation.PreDestroy;
 import org.springframework.data.redis.connection.stream.MapRecord;
 import org.springframework.data.redis.connection.stream.ReadOffset;
@@ -27,6 +29,7 @@ public class StreamXReadConsumer {
 
     private final StringRedisTemplate redisTemplate;
     private final BenchmarkResultRepository resultRepository;
+    private final MessageRecordRepository messageRecordRepository;
 
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicLong messageCount = new AtomicLong(0);
@@ -34,9 +37,11 @@ public class StreamXReadConsumer {
     private volatile Thread consumerThread;
     private volatile ReadOffset readOffset;
 
-    public StreamXReadConsumer(StringRedisTemplate redisTemplate, BenchmarkResultRepository resultRepository) {
+    public StreamXReadConsumer(StringRedisTemplate redisTemplate, BenchmarkResultRepository resultRepository,
+                               MessageRecordRepository messageRecordRepository) {
         this.redisTemplate = redisTemplate;
         this.resultRepository = resultRepository;
+        this.messageRecordRepository = messageRecordRepository;
     }
 
     public Map<String, Object> start() {
@@ -62,7 +67,12 @@ public class StreamXReadConsumer {
                                 StreamOffset.create(STREAM_KEY, readOffset)
                         );
                 if (records != null && !records.isEmpty()) {
-                    messageCount.addAndGet(records.size());
+                    for (MapRecord<String, Object, Object> record : records) {
+                        String payload = String.valueOf(record.getValue().get("payload"));
+                        messageRecordRepository.save(
+                                new MessageRecord(BenchmarkResult.PatternType.STREAM_XREAD, payload, LocalDateTime.now()));
+                        messageCount.incrementAndGet();
+                    }
                     // 다음 읽기를 위해 마지막 수신 ID 이후부터 읽도록 오프셋 갱신
                     String lastId = records.get(records.size() - 1).getId().getValue();
                     readOffset = ReadOffset.from(lastId);
@@ -73,6 +83,32 @@ public class StreamXReadConsumer {
                 }
             }
         }
+        // stop() 호출 후 스트림에 남은 메시지 드레인
+        drainRemaining();
+    }
+
+    @SuppressWarnings("unchecked")
+    private void drainRemaining() {
+        while (true) {
+            try {
+                List<MapRecord<String, Object, Object>> records = (List<MapRecord<String, Object, Object>>)
+                        (List<?>) redisTemplate.opsForStream().read(
+                                StreamReadOptions.empty().count(100),
+                                StreamOffset.create(STREAM_KEY, readOffset)
+                        );
+                if (records == null || records.isEmpty()) break;
+                for (MapRecord<String, Object, Object> record : records) {
+                    String payload = String.valueOf(record.getValue().get("payload"));
+                    messageRecordRepository.save(
+                            new MessageRecord(BenchmarkResult.PatternType.STREAM_XREAD, payload, LocalDateTime.now()));
+                    messageCount.incrementAndGet();
+                }
+                String lastId = records.get(records.size() - 1).getId().getValue();
+                readOffset = ReadOffset.from(lastId);
+            } catch (Exception e) {
+                break;
+            }
+        }
     }
 
     public Map<String, Object> stop() {
@@ -81,7 +117,7 @@ public class StreamXReadConsumer {
         }
         if (consumerThread != null) {
             try {
-                consumerThread.join(3000);
+                consumerThread.join(30000);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }

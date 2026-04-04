@@ -2,6 +2,8 @@ package com.example.consumer.pubsub;
 
 import com.example.consumer.common.BenchmarkResult;
 import com.example.consumer.common.BenchmarkResultRepository;
+import com.example.consumer.common.MessageRecord;
+import com.example.consumer.common.MessageRecordRepository;
 import org.springframework.data.redis.connection.Message;
 import org.springframework.data.redis.connection.MessageListener;
 import org.springframework.data.redis.listener.ChannelTopic;
@@ -24,15 +26,18 @@ public class PubSubConsumer implements MessageListener {
 
     private final RedisMessageListenerContainer listenerContainer;
     private final BenchmarkResultRepository resultRepository;
+    private final MessageRecordRepository messageRecordRepository;
 
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicLong messageCount = new AtomicLong(0);
     private volatile Instant startTime;
 
     public PubSubConsumer(RedisMessageListenerContainer listenerContainer,
-                          BenchmarkResultRepository resultRepository) {
+                          BenchmarkResultRepository resultRepository,
+                          MessageRecordRepository messageRecordRepository) {
         this.listenerContainer = listenerContainer;
         this.resultRepository = resultRepository;
+        this.messageRecordRepository = messageRecordRepository;
     }
 
     public Map<String, Object> start() {
@@ -47,6 +52,9 @@ public class PubSubConsumer implements MessageListener {
 
     @Override
     public void onMessage(Message message, byte[] pattern) {
+        String payload = new String(message.getBody());
+        messageRecordRepository.save(
+                new MessageRecord(BenchmarkResult.PatternType.PUBSUB, payload, LocalDateTime.now()));
         messageCount.incrementAndGet();
     }
 

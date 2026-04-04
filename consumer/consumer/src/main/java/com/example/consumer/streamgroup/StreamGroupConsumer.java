@@ -2,6 +2,8 @@ package com.example.consumer.streamgroup;
 
 import com.example.consumer.common.BenchmarkResult;
 import com.example.consumer.common.BenchmarkResultRepository;
+import com.example.consumer.common.MessageRecord;
+import com.example.consumer.common.MessageRecordRepository;
 import jakarta.annotation.PreDestroy;
 import org.springframework.data.redis.connection.stream.*;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -27,15 +29,18 @@ public class StreamGroupConsumer {
 
     private final StringRedisTemplate redisTemplate;
     private final BenchmarkResultRepository resultRepository;
+    private final MessageRecordRepository messageRecordRepository;
 
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicLong messageCount = new AtomicLong(0);
     private volatile Instant startTime;
     private volatile Thread consumerThread;
 
-    public StreamGroupConsumer(StringRedisTemplate redisTemplate, BenchmarkResultRepository resultRepository) {
+    public StreamGroupConsumer(StringRedisTemplate redisTemplate, BenchmarkResultRepository resultRepository,
+                               MessageRecordRepository messageRecordRepository) {
         this.redisTemplate = redisTemplate;
         this.resultRepository = resultRepository;
+        this.messageRecordRepository = messageRecordRepository;
     }
 
     public Map<String, Object> start() {
@@ -56,6 +61,10 @@ public class StreamGroupConsumer {
      * 스트림이 없어도 자동 생성(MKSTREAM), 그룹이 이미 존재하면(BUSYGROUP) 무시
      */
     private void initConsumerGroup() {
+        // 이전 실행의 pending 메시지(PEL) 오염을 막기 위해 그룹이 존재하면 삭제 후 재생성
+        try {
+            redisTemplate.opsForStream().destroyGroup(STREAM_KEY, GROUP_NAME);
+        } catch (Exception ignored) {}
         try {
             redisTemplate.execute((org.springframework.data.redis.core.RedisCallback<Object>) connection ->
                     connection.execute("XGROUP",
@@ -67,12 +76,7 @@ public class StreamGroupConsumer {
                     )
             );
         } catch (Exception e) {
-            String msg = e.getMessage() != null ? e.getMessage() : "";
-            String causeMsg = e.getCause() != null && e.getCause().getMessage() != null ? e.getCause().getMessage() : "";
-            if (!msg.contains("BUSYGROUP") && !causeMsg.contains("BUSYGROUP")) {
-                throw new RuntimeException("컨슈머 그룹 초기화 실패: " + msg, e);
-            }
-            // BUSYGROUP: 이미 존재하는 그룹 → 정상
+            throw new RuntimeException("컨슈머 그룹 초기화 실패: " + e.getMessage(), e);
         }
     }
 
@@ -90,7 +94,12 @@ public class StreamGroupConsumer {
                                 StreamOffset.create(STREAM_KEY, ReadOffset.lastConsumed()) // '>'
                         );
                 if (records != null && !records.isEmpty()) {
-                    messageCount.addAndGet(records.size());
+                    for (MapRecord<String, Object, Object> record : records) {
+                        String payload = String.valueOf(record.getValue().get("payload"));
+                        messageRecordRepository.save(
+                                new MessageRecord(BenchmarkResult.PatternType.STREAM_GROUP, payload, LocalDateTime.now()));
+                        messageCount.incrementAndGet();
+                    }
                     // 처리 완료 후 ACK
                     RecordId[] ids = records.stream()
                             .map(MapRecord::getId)
@@ -103,6 +112,35 @@ public class StreamGroupConsumer {
                 }
             }
         }
+        // stop() 호출 후 스트림에 남은 메시지 드레인
+        drainRemaining();
+    }
+
+    @SuppressWarnings("unchecked")
+    private void drainRemaining() {
+        Consumer consumer = Consumer.from(GROUP_NAME, CONSUMER_NAME);
+        StreamReadOptions options = StreamReadOptions.empty().count(100);
+        while (true) {
+            try {
+                List<MapRecord<String, Object, Object>> records = (List<MapRecord<String, Object, Object>>)
+                        (List<?>) redisTemplate.opsForStream().read(
+                                consumer,
+                                options,
+                                StreamOffset.create(STREAM_KEY, ReadOffset.lastConsumed())
+                        );
+                if (records == null || records.isEmpty()) break;
+                for (MapRecord<String, Object, Object> record : records) {
+                    String payload = String.valueOf(record.getValue().get("payload"));
+                    messageRecordRepository.save(
+                            new MessageRecord(BenchmarkResult.PatternType.STREAM_GROUP, payload, LocalDateTime.now()));
+                    messageCount.incrementAndGet();
+                }
+                RecordId[] ids = records.stream().map(MapRecord::getId).toArray(RecordId[]::new);
+                redisTemplate.opsForStream().acknowledge(STREAM_KEY, GROUP_NAME, ids);
+            } catch (Exception e) {
+                break;
+            }
+        }
     }
 
     public Map<String, Object> stop() {
@@ -111,7 +149,7 @@ public class StreamGroupConsumer {
         }
         if (consumerThread != null) {
             try {
-                consumerThread.join(3000);
+                consumerThread.join(30000);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }

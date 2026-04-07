@@ -5,10 +5,12 @@ PRODUCER = "http://localhost:8080"
 CONSUMER = "http://localhost:8081"
 N = 10000
 
+
 PATTERNS = ["queue", "stream-xread", "stream-group", "pubsub"]
 
 
 def benchmark(pattern: str, n: int = N):
+
     send_url = f"{PRODUCER}/{pattern}/send"
     print(f"\n[{pattern.upper()}] 시작 (메시지 {n:,}개)")
 

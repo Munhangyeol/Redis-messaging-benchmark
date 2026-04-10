@@ -169,6 +169,52 @@ curl -X POST http://localhost:8081/queue/stop
   "throughput": "20733.47 msg/sec"
 }
 ```
+---
+## 패턴별 동작 원리
+
+### Queue
+
+1. `http://localhost:8081/queue/start` 호출을 통해 consumer 프로세스 내부에서 `queue-consumer`라는 이름의 데몬 쓰레드를 생성하고 실행.
+2. `http://localhost:8080/queue/send` API를 통해 producer 프로세스가 Redis List(`redis:queue`)에 `LPUSH` 명령으로 메시지를 전송.
+3. consumer 쓰레드는 반복문 안에서 1초 timeout의 blocking BRPOP 방식으로 Redis queue에서 메시지를 대기.
+4. 메시지가 존재하면 이를 소비하고, DB I/O 저장 로직을 수행한 후 messageCount를 증가시킴.
+5. producer가 모든 메시지 전송을 마치면 `http://localhost:8081/queue/stop` API를 호출함. stop API는 consumer 종료 플래그를 내리고, join으로 consumer 쓰레드가 종료될 때까지 최대 30초 대기한 뒤 최종 결과 값을 반환.
+
+<img width="2271" height="1470" alt="mermaid-diagram" src="https://github.com/user-attachments/assets/33b5ad29-b074-44c1-89d8-06321bf315c5" />
+
+
+### Stream XREAD
+
+1. `http://localhost:8081/stream-xread/start` 호출을 통해 consumer 프로세스 내부에서 `stream-xread-consumer`라는 이름의 데몬 쓰레드를 생성하고 실행. 이 시점에 readOffset을 `$`(latest)로 초기화하여 start 이후에 들어오는 신규 메시지만 읽도록 설정.
+2. `http://localhost:8080/stream-xread/send` API를 통해 producer 프로세스가 Redis Stream(`redis:stream:xread`)에 `XADD` 명령으로 메시지를 전송.
+3. consumer 쓰레드는 반복문 안에서 1초 timeout의 blocking XREAD 방식으로 Redis Stream에서 최대 100건씩 메시지를 대기.
+4. 메시지가 존재하면 수신된 records를 리스트로 변환하여 `saveAll()`로 일괄 DB I/O 저장한 후 messageCount를 일괄 증가시키고, 다음 읽기를 위해 readOffset을 마지막 수신 메시지 ID로 갱신.
+5. producer가 모든 메시지 전송을 마치면 `http://localhost:8081/stream-xread/stop` API를 호출함. stop API는 consumer 종료 플래그를 내리고, join으로 consumer 쓰레드가 종료될 때까지 최대 30초 대기함. 쓰레드 종료 전 남은 스트림 메시지를 non-blocking으로 드레인하여 DB 저장한 뒤 최종 결과 값을 반환.
+
+<img width="2168" height="1582" alt="mermaid-diagram (1)" src="https://github.com/user-attachments/assets/4643fe05-1d9d-4afd-9f3d-f1804608f9d7" />
+
+
+### Stream Group
+
+1. `http://localhost:8081/stream-group/start` 호출을 통해, 기존 컨슈머 그룹을 삭제 후 `XGROUP CREATE ... $ MKSTREAM`으로 재생성(PEL 오염 방지)하고, `stream-group-consumer`라는 이름의 데몬 쓰레드를 생성하고 실행.
+2. `http://localhost:8080/stream-group/send` API를 통해 producer 프로세스가 Redis Stream(`redis:stream:group`)에 `XADD` 명령으로 메시지를 전송.
+3. consumer 쓰레드는 반복문 안에서 1초 timeout의 blocking XREADGROUP 방식으로 ReadOffset `>`(미전달 신규 메시지)를 기준으로 Redis Stream에서 최대 100건씩 메시지를 대기.
+4. 메시지가 존재하면 수신된 records를 리스트로 변환하여 `saveAll()`로 일괄 DB I/O 저장한 후 messageCount를 일괄 증가시키고, 이후 `XACK` 명령으로 처리 완료를 그룹에 알림.
+5. producer가 모든 메시지 전송을 마치면 `http://localhost:8081/stream-group/stop` API를 호출함. stop API는 consumer 종료 플래그를 내리고, join으로 consumer 쓰레드가 종료될 때까지 최대 30초 대기함. 쓰레드 종료 전 남은 스트림 메시지를 non-blocking으로 드레인하여 DB 저장 및 ACK한 뒤 최종 결과 값을 반환.
+
+<img width="2035" height="1694" alt="mermaid-diagram (3)" src="https://github.com/user-attachments/assets/de1948c9-cb8a-4c5f-9b52-20d4724a8857" />
+
+### Pub/Sub
+
+1. `http://localhost:8081/pubsub/start` 호출을 통해 Spring의 `RedisMessageListenerContainer`에 메시지 리스너를 등록. 별도의 데몬 쓰레드를 직접 생성하지 않으며, 컨테이너 내부 쓰레드 풀이 구독을 관리.
+2. `http://localhost:8080/pubsub/send` API를 통해 producer 프로세스가 Redis Pub/Sub 채널(`redis:pubsub`)에 `PUBLISH` 명령으로 메시지를 전송.
+3. consumer는 이벤트 드리븐 방식으로 동작함. 메시지가 채널에 발행되면 `onMessage()` 콜백이 즉시 호출됨.
+4. 콜백 내에서 메시지를 DB I/O 저장한 후 messageCount를 증가시킴. Pub/Sub 특성상 메시지는 영속되지 않으며 subscriber가 없으면 유실됨.
+5. producer가 모든 메시지 전송을 마치면 `http://localhost:8081/pubsub/stop` API를 호출함. stop API는 컨테이너에서 리스너를 제거(thread.join 없음)하고 즉시 최종 결과 값을 반환.
+
+<img width="1948" height="1358" alt="mermaid-diagram (4)" src="https://github.com/user-attachments/assets/770d8982-dd90-4c95-8923-564a3b12c562" />
+
+
 
 ---
 
@@ -275,52 +321,6 @@ Consumer Group 기반으로 **ACK되지 않은 메시지는 PEL(Pending Entries 
 
 ---
 
-## 패턴별 동작 원리
-
-### Queue
-
-1. `http://localhost:8081/queue/start` 호출을 통해 consumer 프로세스 내부에서 `queue-consumer`라는 이름의 데몬 쓰레드를 생성하고 실행.
-2. `http://localhost:8080/queue/send` API를 통해 producer 프로세스가 Redis List(`redis:queue`)에 `LPUSH` 명령으로 메시지를 전송.
-3. consumer 쓰레드는 반복문 안에서 1초 timeout의 blocking BRPOP 방식으로 Redis queue에서 메시지를 대기.
-4. 메시지가 존재하면 이를 소비하고, DB I/O 저장 로직을 수행한 후 messageCount를 증가시킴.
-5. producer가 모든 메시지 전송을 마치면 `http://localhost:8081/queue/stop` API를 호출함. stop API는 consumer 종료 플래그를 내리고, join으로 consumer 쓰레드가 종료될 때까지 최대 30초 대기한 뒤 최종 결과 값을 반환.
-
-<img width="2271" height="1470" alt="mermaid-diagram" src="https://github.com/user-attachments/assets/33b5ad29-b074-44c1-89d8-06321bf315c5" />
-
-
-### Stream XREAD
-
-1. `http://localhost:8081/stream-xread/start` 호출을 통해 consumer 프로세스 내부에서 `stream-xread-consumer`라는 이름의 데몬 쓰레드를 생성하고 실행. 이 시점에 readOffset을 `$`(latest)로 초기화하여 start 이후에 들어오는 신규 메시지만 읽도록 설정.
-2. `http://localhost:8080/stream-xread/send` API를 통해 producer 프로세스가 Redis Stream(`redis:stream:xread`)에 `XADD` 명령으로 메시지를 전송.
-3. consumer 쓰레드는 반복문 안에서 1초 timeout의 blocking XREAD 방식으로 Redis Stream에서 최대 100건씩 메시지를 대기.
-4. 메시지가 존재하면 수신된 records를 리스트로 변환하여 `saveAll()`로 일괄 DB I/O 저장한 후 messageCount를 일괄 증가시키고, 다음 읽기를 위해 readOffset을 마지막 수신 메시지 ID로 갱신.
-5. producer가 모든 메시지 전송을 마치면 `http://localhost:8081/stream-xread/stop` API를 호출함. stop API는 consumer 종료 플래그를 내리고, join으로 consumer 쓰레드가 종료될 때까지 최대 30초 대기함. 쓰레드 종료 전 남은 스트림 메시지를 non-blocking으로 드레인하여 DB 저장한 뒤 최종 결과 값을 반환.
-
-<img width="2168" height="1582" alt="mermaid-diagram (1)" src="https://github.com/user-attachments/assets/4643fe05-1d9d-4afd-9f3d-f1804608f9d7" />
-
-
-### Stream Group
-
-1. `http://localhost:8081/stream-group/start` 호출을 통해, 기존 컨슈머 그룹을 삭제 후 `XGROUP CREATE ... $ MKSTREAM`으로 재생성(PEL 오염 방지)하고, `stream-group-consumer`라는 이름의 데몬 쓰레드를 생성하고 실행.
-2. `http://localhost:8080/stream-group/send` API를 통해 producer 프로세스가 Redis Stream(`redis:stream:group`)에 `XADD` 명령으로 메시지를 전송.
-3. consumer 쓰레드는 반복문 안에서 1초 timeout의 blocking XREADGROUP 방식으로 ReadOffset `>`(미전달 신규 메시지)를 기준으로 Redis Stream에서 최대 100건씩 메시지를 대기.
-4. 메시지가 존재하면 수신된 records를 리스트로 변환하여 `saveAll()`로 일괄 DB I/O 저장한 후 messageCount를 일괄 증가시키고, 이후 `XACK` 명령으로 처리 완료를 그룹에 알림.
-5. producer가 모든 메시지 전송을 마치면 `http://localhost:8081/stream-group/stop` API를 호출함. stop API는 consumer 종료 플래그를 내리고, join으로 consumer 쓰레드가 종료될 때까지 최대 30초 대기함. 쓰레드 종료 전 남은 스트림 메시지를 non-blocking으로 드레인하여 DB 저장 및 ACK한 뒤 최종 결과 값을 반환.
-
-<img width="2035" height="1694" alt="mermaid-diagram (3)" src="https://github.com/user-attachments/assets/de1948c9-cb8a-4c5f-9b52-20d4724a8857" />
-
-### Pub/Sub
-
-1. `http://localhost:8081/pubsub/start` 호출을 통해 Spring의 `RedisMessageListenerContainer`에 메시지 리스너를 등록. 별도의 데몬 쓰레드를 직접 생성하지 않으며, 컨테이너 내부 쓰레드 풀이 구독을 관리.
-2. `http://localhost:8080/pubsub/send` API를 통해 producer 프로세스가 Redis Pub/Sub 채널(`redis:pubsub`)에 `PUBLISH` 명령으로 메시지를 전송.
-3. consumer는 이벤트 드리븐 방식으로 동작함. 메시지가 채널에 발행되면 `onMessage()` 콜백이 즉시 호출됨.
-4. 콜백 내에서 메시지를 DB I/O 저장한 후 messageCount를 증가시킴. Pub/Sub 특성상 메시지는 영속되지 않으며 subscriber가 없으면 유실됨.
-5. producer가 모든 메시지 전송을 마치면 `http://localhost:8081/pubsub/stop` API를 호출함. stop API는 컨테이너에서 리스너를 제거(thread.join 없음)하고 즉시 최종 결과 값을 반환.
-
-<img width="1948" height="1358" alt="mermaid-diagram (4)" src="https://github.com/user-attachments/assets/770d8982-dd90-4c95-8923-564a3b12c562" />
-
----
-
 ## 설정
 
 ### Redis 연결
@@ -346,9 +346,5 @@ spring.jpa.hibernate.ddl-auto=update
 
 ---
 
-## 참고사항
-
-- **Pub/Sub**: Consumer가 구독 중인 동안 발행된 메시지만 수신됨. `/start` 이전에 전송된 메시지는 유실됨.
-- **Stream Group**: Consumer 그룹(`benchmark-group`)은 Consumer `/start` 호출 시 자동 생성됨. Producer에서 별도로 그룹을 생성할 필요 없음.
 - **Stream 메시지 형식**: Stream 패턴(XREAD/Group)은 메시지를 해시맵(`{"payload": "message-1"}`) 형태로 저장함.
 - **포트 충돌**: Consumer는 `8081`, Producer는 `8080`으로 고정됨.

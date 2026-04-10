@@ -32,6 +32,7 @@ public class PubSubConsumer implements MessageListener {
     private final AtomicLong messageCount = new AtomicLong(0);
     // push 기반이므로 onMessage가 listener 스레드에서 동시 호출될 수 있음
     private final AtomicLong inFlight = new AtomicLong(0);
+    private final AtomicLong processCount = new AtomicLong(0);
     private volatile Instant startTime;
 
     public PubSubConsumer(RedisMessageListenerContainer listenerContainer,
@@ -48,6 +49,7 @@ public class PubSubConsumer implements MessageListener {
         }
         messageCount.set(0);
         inFlight.set(0);
+        processCount.set(0);
         startTime = Instant.now();
         listenerContainer.addMessageListener(this, new ChannelTopic(CHANNEL));
         return Map.of("status", "started", "channel", CHANNEL);
@@ -58,6 +60,9 @@ public class PubSubConsumer implements MessageListener {
         if (!accepting.get()) return;
         inFlight.incrementAndGet();
         try {
+            if (processCount.incrementAndGet() % 4 == 0) {
+                throw new RuntimeException("Fault injection: simulated processing error (msg #" + processCount.get() + ")");
+            }
             String payload = new String(message.getBody());
             messageRecordRepository.save(
                     new MessageRecord(BenchmarkResult.PatternType.PUBSUB, payload, LocalDateTime.now()));

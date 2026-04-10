@@ -3,7 +3,7 @@ import time
 
 PRODUCER = "http://localhost:8080"
 CONSUMER = "http://localhost:8081"
-N = 10000
+N = 1000
 
 
 PATTERNS = ["queue", "stream-xread", "stream-group", "pubsub"]

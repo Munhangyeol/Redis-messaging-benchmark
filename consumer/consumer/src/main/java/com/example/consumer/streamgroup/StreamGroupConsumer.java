@@ -31,8 +31,15 @@ public class StreamGroupConsumer {
     private final BenchmarkResultRepository resultRepository;
     private final MessageRecordRepository messageRecordRepository;
 
+    /**
+     * PEL 재처리 최대 재시도 횟수.
+     * 이 횟수를 초과하면 해당 배치는 ACK 없이 포기(메시지는 PEL에 잔류, 운영 환경에서는 별도 알람/DLQ 처리 필요).
+     */
+    private static final int MAX_PEL_RETRIES = 3;
+
     private final AtomicBoolean accepting = new AtomicBoolean(false);
     private final AtomicLong messageCount = new AtomicLong(0);
+    private final AtomicLong processCount = new AtomicLong(0);
     private volatile Instant startTime;
     private volatile Thread consumerThread;
 
@@ -48,6 +55,7 @@ public class StreamGroupConsumer {
             return Map.of("status", "already_running", "totalMessages", messageCount.get());
         }
         messageCount.set(0);
+        processCount.set(0);
         startTime = Instant.now();
         initConsumerGroup();
         consumerThread = new Thread(this::consume, "stream-group-consumer");
@@ -87,29 +95,63 @@ public class StreamGroupConsumer {
     @SuppressWarnings("unchecked")
     private void consume() {
         Consumer consumer = Consumer.from(GROUP_NAME, CONSUMER_NAME);
+        // PEL 재처리 여부 추적: 예외 발생 시 true → 다음 루프에서 "0-0"으로 PEL 먼저 읽어서 재처리
+        boolean hasPending = false;
+        // 연속 PEL 재처리 실패 횟수: MAX_PEL_RETRIES 초과 시 해당 배치 포기
+        int pelRetryCount = 0;
 
         while (true) {
             try {
                 List<MapRecord<String, Object, Object>> records;
                 if (accepting.get()) {
-                    // producer 진행 중: 블로킹 read (최대 1초 대기)
-                    records = (List<MapRecord<String, Object, Object>>) (List<?>)
-                            redisTemplate.opsForStream().read(
-                                    consumer,
-                                    StreamReadOptions.empty().block(Duration.ofSeconds(1)).count(100),
-                                    StreamOffset.create(STREAM_KEY, ReadOffset.lastConsumed())
-                            );
+                    if (hasPending) {
+                        // [재시도] PEL(미ack) 메시지를 "0-0"부터 읽어 재처리
+                        records = (List<MapRecord<String, Object, Object>>) (List<?>)
+                                redisTemplate.opsForStream().read(
+                                        consumer,
+                                        StreamReadOptions.empty().count(100),
+                                        StreamOffset.create(STREAM_KEY, ReadOffset.from("0-0"))
+                                );
+                        if (records == null || records.isEmpty()) {
+                            // PEL 소진: 재처리 성공으로 간주하고 새 메시지 읽기로 복귀
+                            hasPending = false;
+                            pelRetryCount = 0;
+                            continue;
+                        }
+                    } else {
+                        // 정상 경로: 새 메시지 블로킹 read (최대 1초 대기)
+                        records = (List<MapRecord<String, Object, Object>>) (List<?>)
+                                redisTemplate.opsForStream().read(
+                                        consumer,
+                                        StreamReadOptions.empty().block(Duration.ofSeconds(1)).count(100),
+                                        StreamOffset.create(STREAM_KEY, ReadOffset.lastConsumed())
+                                );
+                    }
                 } else {
-                    // producer 완료 신호 받음: 논블로킹으로 남은 메시지 드레인
+                    // producer 완료 신호 받음: PEL 먼저 드레인 후 새 메시지 드레인
+                    ReadOffset offset = hasPending ? ReadOffset.from("0-0") : ReadOffset.lastConsumed();
                     records = (List<MapRecord<String, Object, Object>>) (List<?>)
                             redisTemplate.opsForStream().read(
                                     consumer,
                                     StreamReadOptions.empty().count(100),
-                                    StreamOffset.create(STREAM_KEY, ReadOffset.lastConsumed())
+                                    StreamOffset.create(STREAM_KEY, offset)
                             );
-                    if (records == null || records.isEmpty()) break; // 스트림 비었음 → 종료
+                    if (records == null || records.isEmpty()) {
+                        if (hasPending) {
+                            hasPending = false; // PEL 소진 → 새 메시지 드레인으로 전환
+                            pelRetryCount = 0;
+                            continue;
+                        }
+                        break; // 새 메시지도 없음 → 종료
+                    }
                 }
                 if (records != null && !records.isEmpty()) {
+                    if (processCount.addAndGet(records.size()) % 4 == 0) {
+                        // 장애 주입: ACK 없이 예외 발생 → 메시지가 PEL에 잔류하여 재처리 가능
+                        hasPending = true;
+                        pelRetryCount++;
+                        throw new RuntimeException("Fault injection: simulated processing error (batch ending at msg #" + processCount.get() + ")");
+                    }
                     List<MessageRecord> batch = records.stream()
                             .map(r -> new MessageRecord(BenchmarkResult.PatternType.STREAM_GROUP,
                                     String.valueOf(r.getValue().get("payload")), LocalDateTime.now()))
@@ -120,10 +162,28 @@ public class StreamGroupConsumer {
                             .map(MapRecord::getId)
                             .toArray(RecordId[]::new);
                     redisTemplate.opsForStream().acknowledge(STREAM_KEY, GROUP_NAME, ids);
+                    // ACK 완료: 재시도 상태 초기화
+                    hasPending = false;
+                    pelRetryCount = 0;
                 }
             } catch (Exception e) {
-                if (!accepting.get()) break;
-                try { Thread.sleep(500); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+                if (hasPending && pelRetryCount >= MAX_PEL_RETRIES) {
+                    // 재시도 한계 초과: 해당 PEL 배치 포기 (메시지는 PEL에 잔류)
+                    // 운영 환경에서는 XAUTOCLAIM, DLQ, 알람 등 추가 처리 필요
+                    hasPending = false;
+                    pelRetryCount = 0;
+                } else if (hasPending) {
+                    // PEL 재처리 재시도: 지수 백오프로 대기 (100ms, 200ms, 400ms ...)
+                    long backoffMs = 100L * (1L << (pelRetryCount - 1));
+                    try { Thread.sleep(backoffMs); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+                }
+                if (!accepting.get()) {
+                    if (hasPending) continue; // PEL이 남아있으면 재처리 후 종료
+                    break;
+                }
+                if (!hasPending) {
+                    try { Thread.sleep(100); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+                }
             }
         }
     }

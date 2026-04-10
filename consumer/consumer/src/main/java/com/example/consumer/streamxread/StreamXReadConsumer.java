@@ -33,6 +33,7 @@ public class StreamXReadConsumer {
 
     private final AtomicBoolean accepting = new AtomicBoolean(false);
     private final AtomicLong messageCount = new AtomicLong(0);
+    private final AtomicLong processCount = new AtomicLong(0);
     private volatile Instant startTime;
     private volatile Thread consumerThread;
     private volatile ReadOffset readOffset;
@@ -49,6 +50,7 @@ public class StreamXReadConsumer {
             return Map.of("status", "already_running", "totalMessages", messageCount.get());
         }
         messageCount.set(0);
+        processCount.set(0);
         startTime = Instant.now();
         // 이전 실행 스트림 데이터 초기화: 삭제 후 "0-0"부터 읽으면
         // consumer thread가 첫 XREAD 호출 전에 메시지가 도착해도 누락 없음 ($는 호출 시점 평가라 race condition 발생)
@@ -69,27 +71,30 @@ public class StreamXReadConsumer {
                     // producer 진행 중: 블로킹 read (최대 1초 대기)
                     records = (List<MapRecord<String, Object, Object>>) (List<?>)
                             redisTemplate.opsForStream().read(
-                                    StreamReadOptions.empty().block(Duration.ofSeconds(1)).count(100),
+                                    StreamReadOptions.empty().block(Duration.ofSeconds(1)).count(1),
                                     StreamOffset.create(STREAM_KEY, readOffset)
                             );
                 } else {
                     // producer 완료 신호 받음: 논블로킹으로 남은 메시지 드레인
                     records = (List<MapRecord<String, Object, Object>>) (List<?>)
                             redisTemplate.opsForStream().read(
-                                    StreamReadOptions.empty().count(100),
+                                    StreamReadOptions.empty().count(1),
                                     StreamOffset.create(STREAM_KEY, readOffset)
                             );
                     if (records == null || records.isEmpty()) break; // 스트림 비었음 → 종료
                 }
                 if (records != null && !records.isEmpty()) {
+                    String lastId = records.get(records.size() - 1).getId().getValue();
+                    if (processCount.addAndGet(records.size()) % 4 == 0) {
+                        throw new RuntimeException("Fault injection: simulated processing error (batch ending at msg #" + processCount.get() + ")");
+                    }
                     List<MessageRecord> batch = records.stream()
                             .map(r -> new MessageRecord(BenchmarkResult.PatternType.STREAM_XREAD,
                                     String.valueOf(r.getValue().get("payload")), LocalDateTime.now()))
                             .toList();
                     messageRecordRepository.saveAll(batch);
+                    readOffset = ReadOffset.from(lastId); // 저장 성공 후 offset 갱신 → 실패 시 재처리 가능
                     messageCount.addAndGet(records.size());
-                    String lastId = records.get(records.size() - 1).getId().getValue();
-                    readOffset = ReadOffset.from(lastId);
                 }
             } catch (Exception e) {
                 if (!accepting.get()) break;

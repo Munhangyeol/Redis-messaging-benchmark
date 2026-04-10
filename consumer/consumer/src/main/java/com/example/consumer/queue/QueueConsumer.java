@@ -29,6 +29,7 @@ public class QueueConsumer {
 
     private final AtomicBoolean accepting = new AtomicBoolean(false);
     private final AtomicLong messageCount = new AtomicLong(0);
+    private final AtomicLong processCount = new AtomicLong(0);
     private volatile Instant startTime;
     private volatile Thread consumerThread;
 
@@ -44,6 +45,7 @@ public class QueueConsumer {
             return Map.of("status", "already_running", "totalMessages", messageCount.get());
         }
         messageCount.set(0);
+        processCount.set(0);
         startTime = Instant.now();
         consumerThread = new Thread(this::consume, "queue-consumer");
         consumerThread.setDaemon(true);
@@ -64,6 +66,9 @@ public class QueueConsumer {
                     if (value == null) break; // 큐 비었음 → 종료
                 }
                 if (value != null) {
+                    if (processCount.incrementAndGet() % 4 == 0) {
+                        throw new RuntimeException("Fault injection: simulated processing error (msg #" + processCount.get() + ")");
+                    }
                     messageRecordRepository.save(
                             new MessageRecord(BenchmarkResult.PatternType.QUEUE, value, LocalDateTime.now()));
                     messageCount.incrementAndGet();

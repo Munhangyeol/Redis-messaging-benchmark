@@ -75,6 +75,8 @@ public class QueueConsumer {
                 }
             } catch (Exception e) {
                 if (!accepting.get()) break;
+                System.out.println("Error processing message: " + e.getMessage());
+                e.printStackTrace();
             }
         }
     }
